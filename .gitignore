@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Build / GUI artifacts
+build/
+dist/
+*.spec
+dashcam_repair_settings.json
+verify_progress.log
+repair_log.txt
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+
+# Repaired outputs (local testing)
+_repaired/
+_all_repaired/
