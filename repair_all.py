@@ -93,6 +93,12 @@ def video_stco(data, moov_start, moov_end):
 
 
 MAX_GAP = 150000
+# Novatek I-frames can exceed MAX_GAP; search/trust window must span at least inner+slack.
+REACH_SLACK = 50000
+
+
+def _reach(prev_inner):
+    return max(MAX_GAP, prev_inner) + REACH_SLACK
 
 
 def walk_stco(mm, b_offs, n, mdat_end, mdat_payload_start):
@@ -102,13 +108,16 @@ def walk_stco(mm, b_offs, n, mdat_end, mdat_payload_start):
     bootstrap_end = min(mdat_end, mdat_payload_start + 600000)
     for i in range(n):
         chosen = None
+        inner_prev = 0
+        if prev is not None:
+            inner_prev = struct.unpack(">I", mm[prev : prev + 4])[0]
+        reach = _reach(inner_prev)
         if b_offs[i] < mdat_end and valid_hdr(mm, b_offs[i]):
-            if prev is None or (prev < b_offs[i] <= prev + MAX_GAP):
+            if prev is None or (prev < b_offs[i] <= prev + reach):
                 chosen = b_offs[i]
         if chosen is None and prev is not None:
-            inner = struct.unpack(">I", mm[prev : prev + 4])[0]
-            start = prev + max(inner, 8)
-            end = min(mdat_end, prev + MAX_GAP)
+            start = prev + max(inner_prev, 8)
+            end = min(mdat_end, prev + reach)
             for off in range(start, end - 8):
                 if valid_hdr(mm, off) and off > prev:
                     chosen = off
@@ -304,7 +313,10 @@ def _make_logger(log=print, log_path=None):
         log(msg)
         if fh:
             fh.write(msg + "\n")
-            fh.flush()
+            try:
+                fh.flush()
+            except OSError:
+                pass
 
     return combined, fh
 
@@ -398,7 +410,10 @@ def run_repair_batch(
     log_fn(f"Output folder: {out_dir}")
 
     if log_handle:
-        log_handle.close()
+        try:
+            log_handle.close()
+        except OSError:
+            pass
 
     return out_dir, results, cancelled
 
