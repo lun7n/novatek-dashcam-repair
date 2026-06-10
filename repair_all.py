@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # ISO BMFF containers (same atom structure). Not AVI/MKV/TS.
 SUPPORTED_EXTENSIONS = (".mp4", ".mov", ".m4v", ".3gp")
@@ -21,6 +22,10 @@ HEALTHY_SIZES: set[int] = set()
 MIN_SIZE = 1_000_000  # skip tiny junk; include short shutdown clips (~200 MB)
 DEFAULT_VERIFY_TIMEOUT = 1800  # 30 min per file (full decode of ~4 GB)
 DEFAULT_OUT_SUBFOLDER = "_repaired"
+
+
+def default_workers():
+    return min(4, os.cpu_count() or 1)
 
 
 class RepairCancelled(Exception):
@@ -381,6 +386,19 @@ def _kill_process_tree(exc):
         pass
 
 
+def _parallel_repair_job(job):
+    """Worker for ProcessPoolExecutor; must be module-level for pickling."""
+    index, total, src, out, name = job
+    try:
+        ok, n = repair_file(src, out, log=lambda _m: None)
+        status = "partial" if ok < n else "ok"
+        dur = ok / 30 / 60
+        detail = f"  {name}: {ok:,}/{n:,} samples ({dur:.1f} min)"
+        return index, src, ok, n, status, detail
+    except Exception as e:
+        return index, src, 0, 0, str(e), f"  FAIL {name}: {e}"
+
+
 def _make_logger(log=print, log_path=None):
     fh = open(log_path, "w", encoding="utf-8") if log_path else None
 
@@ -403,6 +421,7 @@ def run_repair_batch(
     out_subfolder=DEFAULT_OUT_SUBFOLDER,
     extensions=None,
     name_suffix="",
+    workers=None,
     cancel_event=None,
     log=print,
     on_progress=None,
@@ -430,44 +449,75 @@ def run_repair_batch(
     mode = "broken only" if broken_only else "all segments"
     ext_label = ", ".join(extensions or SUPPORTED_EXTENSIONS)
 
+    worker_count = max(1, workers if workers is not None else default_workers())
+
     log_fn(f"Repairing {len(targets)} files ({mode})")
     log_fn(f"Formats: {ext_label}")
     log_fn(f"Input:  {movie_dir}")
     log_fn(f"Output: {out_dir}")
+    log_fn(f"Workers: {worker_count}")
     log_fn("Originals are never modified.")
     if name_suffix:
         log_fn(f"Filename suffix: {name_suffix}")
     log_fn("")
 
+    jobs = []
     results = []
-    cancelled = False
     for i, src in enumerate(targets, 1):
-        if cancel_event and cancel_event.is_set():
-            cancelled = True
-            log_fn("\nStopped by user (current file finished; remaining files skipped).")
-            break
-
         name = os.path.basename(src)
         out_name = output_filename(src, name_suffix)
         out = os.path.join(out_dir, out_name)
 
-        # Last-line guard before write.
         if norm_path(src) == norm_path(out):
             log_fn(f"  SKIP {name}: would overwrite source (use --suffix or another output folder)")
             results.append((src, 0, 0, "overwrite blocked"))
             continue
 
-        if on_progress:
-            on_progress(i, len(targets), name)
+        jobs.append((i, len(targets), src, out, name))
 
-        log_fn(f"[{i}/{len(targets)}] {name} ...")
-        try:
-            ok, n = repair_file(src, out, log=log_fn)
-            status = "partial" if ok < n else "ok"
-            results.append((src, ok, n, status))
-        except Exception as e:
-            log_fn(f"  FAIL {name}: {e}")
-            results.append((src, 0, 0, str(e)))
+    cancelled = False
+    if worker_count <= 1:
+        for index, total, src, out, name in jobs:
+            if cancel_event and cancel_event.is_set():
+                cancelled = True
+                log_fn("\nStopped by user (current file finished; remaining files skipped).")
+                break
+
+            if on_progress:
+                on_progress(index, total, name)
+
+            log_fn(f"[{index}/{total}] {name} ...")
+            try:
+                ok, n = repair_file(src, out, log=log_fn)
+                status = "partial" if ok < n else "ok"
+                results.append((src, ok, n, status))
+            except Exception as e:
+                log_fn(f"  FAIL {name}: {e}")
+                results.append((src, 0, 0, str(e)))
+    else:
+        pending = list(jobs)
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            futures = {executor.submit(_parallel_repair_job, job): job for job in pending}
+            done = 0
+            for fut in as_completed(futures):
+                if cancel_event and cancel_event.is_set():
+                    cancelled = True
+                    for f in futures:
+                        f.cancel()
+                    log_fn("\nStop requested; in-flight repairs may still finish.")
+                    break
+
+                index, src, ok, n, status, detail = fut.result()
+                name = os.path.basename(src)
+                done += 1
+                if on_progress:
+                    on_progress(done, len(jobs), name)
+                log_fn(f"[{index}/{len(jobs)}] {name} ...")
+                log_fn(detail)
+                results.append((src, ok, n, status))
+
+            if cancelled:
+                log_fn("\nStopped by user (remaining queued files skipped).")
 
     ok_count = sum(1 for *_, status in results if status in ("ok", "partial"))
     partial_count = sum(1 for *_, ok, n, status in results if status == "partial")
@@ -532,6 +582,12 @@ def main():
         default=DEFAULT_VERIFY_TIMEOUT,
         help=f"Seconds before killing a hung ffmpeg verify (default {DEFAULT_VERIFY_TIMEOUT})",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=f"Parallel repair workers (default: min(4, CPU count) = {default_workers()})",
+    )
     args = parser.parse_args()
 
     if not args.movie_dir:
@@ -546,6 +602,7 @@ def main():
             out_dir=args.out_dir,
             extensions=extensions,
             name_suffix=args.suffix,
+            workers=args.workers,
         )
     except (OutputSafetyError, FileNotFoundError) as e:
         print(f"Error: {e}", file=sys.stderr)

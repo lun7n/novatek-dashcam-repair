@@ -35,12 +35,12 @@ Output: `dist\DashcamRepair.exe` (~10 MB).
 
 ## Publish a release (maintainers)
 
-1. Bump version tag (e.g. `v1.0.1`)
+1. Bump version tag (e.g. `v1.0.3`)
 2. Build the exe locally (or via CI; see below)
 3. Upload to GitHub Releases:
 
 ```bat
-gh release create v1.0.1 dist\DashcamRepair.exe --title "v1.0.1" --notes "Release notes here"
+gh release create v1.0.3 dist\DashcamRepair.exe --title "v1.0.3" --notes "Release notes here"
 ```
 
 Do not commit `dist/` or `build/` to git. Put binaries on Releases only.

@@ -17,7 +17,7 @@ For files with **no** `moov` atom at all, try [untrunc](https://github.com/anthw
 
 ### Windows (no Python needed)
 
-**[Download DashcamRepair.exe (v1.0.1)](https://github.com/lun7n/novatek-dashcam-repair/releases/latest)**
+**[Download DashcamRepair.exe (v1.0.3)](https://github.com/lun7n/novatek-dashcam-repair/releases/latest)**
 
 1. Download `DashcamRepair.exe` from [Releases](https://github.com/lun7n/novatek-dashcam-repair/releases)
 2. Double-click it
@@ -44,8 +44,11 @@ Repaired copies go to `D:\path\to\dashcam\videos\_repaired\`.
 ```bat
 python repair_all.py "D:\videos" --out-dir "D:\videos_fixed"
 python repair_all.py "D:\videos" --suffix _fixed
+python repair_all.py "D:\videos" --workers 4
 python repair_all.py "D:\videos" --verify
 ```
+
+`--workers` runs multiple files in parallel (default `min(4, CPU count)`). Originals are never modified.
 
 ### Requirements
 

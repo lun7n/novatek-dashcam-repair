@@ -37,6 +37,7 @@ class RepairApp(tk.Tk):
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
         self.suffix_var = tk.StringVar(value="")
+        self.workers_var = tk.IntVar(value=repair_all.default_workers())
         self.status_var = tk.StringVar(value="Ready")
         self.ext_vars = {ext: tk.BooleanVar(value=ext == ".mp4") for ext, _ in FORMAT_OPTIONS}
 
@@ -79,6 +80,22 @@ class RepairApp(tk.Tk):
         tk.Label(ext_row, text="File types:").pack(side="left")
         for ext, label in FORMAT_OPTIONS:
             tk.Checkbutton(ext_row, text=label, variable=self.ext_vars[ext]).pack(side="left", padx=(8, 0))
+
+        worker_row = tk.Frame(opt)
+        worker_row.pack(fill="x", padx=8, pady=4)
+        tk.Label(worker_row, text="Parallel workers:").pack(side="left")
+        tk.Spinbox(
+            worker_row,
+            from_=1,
+            to=max(1, (os.cpu_count() or 4)),
+            textvariable=self.workers_var,
+            width=5,
+        ).pack(side="left", padx=(8, 0))
+        tk.Label(
+            worker_row,
+            text=f"(default {repair_all.default_workers()}; 1 = sequential)",
+            fg="gray",
+        ).pack(side="left", padx=(8, 0))
 
         btn_row = tk.Frame(self)
         btn_row.pack(fill="x", **pad)
@@ -195,9 +212,13 @@ class RepairApp(tk.Tk):
         self.log.configure(state="disabled")
 
         suffix = self.suffix_var.get().strip()
+        try:
+            workers = max(1, int(self.workers_var.get()))
+        except (tk.TclError, ValueError):
+            workers = repair_all.default_workers()
         self.worker = threading.Thread(
             target=self.run_repair,
-            args=(inp, out, exts, suffix),
+            args=(inp, out, exts, suffix, workers),
             daemon=True,
         )
         self.worker.start()
@@ -208,13 +229,14 @@ class RepairApp(tk.Tk):
             self.status_var.set("Stopping after current file...")
             self.write_log("\nStop requested. Finishing current file, then stopping.")
 
-    def run_repair(self, inp, out, exts, suffix):
+    def run_repair(self, inp, out, exts, suffix, workers):
         try:
             out_dir, results, cancelled = repair_all.run_repair_batch(
                 inp,
                 out_dir=out,
                 extensions=exts,
                 name_suffix=suffix,
+                workers=workers,
                 cancel_event=self.cancel_event,
                 log=self.thread_log,
                 on_progress=lambda c, t, n: self.after(0, lambda: self.on_progress(c, t, n)),
@@ -265,6 +287,8 @@ class RepairApp(tk.Tk):
             self.input_var.set(data.get("input", ""))
             self.output_var.set(data.get("output", ""))
             self.suffix_var.set(data.get("suffix", ""))
+            if "workers" in data:
+                self.workers_var.set(data["workers"])
             for ext, var in self.ext_vars.items():
                 if ext in data.get("extensions", {}):
                     var.set(data["extensions"][ext])
@@ -276,6 +300,7 @@ class RepairApp(tk.Tk):
             "input": self.input_var.get().strip(),
             "output": self.output_var.get().strip(),
             "suffix": self.suffix_var.get().strip(),
+            "workers": int(self.workers_var.get()),
             "extensions": {ext: var.get() for ext, var in self.ext_vars.items()},
         }
         try:
