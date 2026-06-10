@@ -37,7 +37,7 @@ class RepairApp(tk.Tk):
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
         self.suffix_var = tk.StringVar(value="")
-        self.workers_var = tk.IntVar(value=repair_all.default_workers())
+        self.workers_var = tk.IntVar(value=1)
         self.status_var = tk.StringVar(value="Ready")
         self.ext_vars = {ext: tk.BooleanVar(value=ext == ".mp4") for ext, _ in FORMAT_OPTIONS}
 
@@ -93,7 +93,7 @@ class RepairApp(tk.Tk):
         ).pack(side="left", padx=(8, 0))
         tk.Label(
             worker_row,
-            text=f"(default {repair_all.default_workers()}; 1 = sequential)",
+            text="(default 1; use 2-4 for small batches; 4GB files: keep at 1-2)",
             fg="gray",
         ).pack(side="left", padx=(8, 0))
 
@@ -245,8 +245,8 @@ class RepairApp(tk.Tk):
             self._save_settings()
 
             partial = sum(1 for _, ok, n, st in results if st == "partial")
-            failed = sum(1 for _, ok, n, st in results if st not in ("ok", "partial"))
-            ok = len(results) - failed
+            failed = sum(1 for _, ok, n, st in results if st == "fail" or st not in ("full", "partial"))
+            ok = sum(1 for _, ok, n, st in results if st in ("full", "partial"))
 
             if cancelled:
                 title, msg = "Stopped", f"Repair stopped by user.\n\n{ok} file(s) saved to:\n{out_dir}"

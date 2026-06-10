@@ -7,7 +7,7 @@ Free, open-source repair for **Novatek-style** dashcam MP4/MOV files after power
 Good fit if:
 - The file is roughly normal size but playback stops after a few minutes
 - Re-encoding with ffmpeg gives you a **shorter** output file
-- The `moov` atom is present at the end of the file (index problem, not a truncated recording)
+- The `moov` atom is present (index problem, not a truncated recording)
 
 For files with **no** `moov` atom at all, try [untrunc](https://github.com/anthwlock/untrunc) instead. Restore.Media and similar paid tools cover other failure modes.
 
@@ -48,7 +48,7 @@ python repair_all.py "D:\videos" --workers 4
 python repair_all.py "D:\videos" --verify
 ```
 
-`--workers` runs multiple files in parallel (default `min(4, CPU count)`). Originals are never modified.
+`--workers` runs multiple files in parallel (default **1** for safety on large files). Originals are never modified.
 
 ### Requirements
 
@@ -87,23 +87,51 @@ python repair_all.py "D:\videos" --verify
 | Many Novatek dashcams (Viofo, Street Guardian, common DVRs) | GoPro, phone, DJI containers |
 | Corrupt index when `moov` is present | Missing `moov` entirely |
 
-Output is **video only** (audio track is removed from the repaired file).
+Output is **video only** (audio track is removed from the repaired file). There is **no compression step**; earlier experiments with post-repair compression produced unplayable files and were removed.
 
-Tested on **1280x720 @ 30fps** Novatek segments with a `frea` atom and `moov` at the end of the file. Other resolutions on the same firmware family may work as well. Very high bitrates (e.g. 4K) might need small constant tweaks in the source.
+Tested on **1280x720 @ 30fps** Novatek segments. Other resolutions on the same firmware family may work as well.
+
+---
+
+## File layouts (auto-detected)
+
+The tool detects layout from atom order; you do not pick a mode.
+
+| Layout | Typical source | `mdat` end boundary |
+|--------|----------------|---------------------|
+| **moov-last** | Raw ~4 GB dashcam segments | `moov` start (index at end of file) |
+| **moov-first** | Re-exported or trimmed clips | Full file size |
+
+For **moov-first** exports, the `stco` table in the file is often truncated. The tool rebuilds it from `stsz`/`ctts` sample counts and writes a new `moov` before `mdat`.
 
 ---
 
 ## How it works
 
 1. Read the existing `moov` (index is wrong, not missing)
-2. Walk `mdat` using Novatek chunk headers:
-   - Type A: `01/41 9a 00`
-   - Type B: `65 88 80` (about every 15 frames)
-3. Keep offsets that already look valid; walk forward when they do not
-4. Rebuild `stsz` from chunk inner sizes
-5. Write a new file: original `ftyp` + `frea` + `mdat` + fixed `moov`
+2. Detect moov-first vs moov-last and set the correct `mdat` search boundary
+3. Walk `mdat` using Novatek chunk headers (1-byte search steps):
+   - **Type A:** `01/41 9a 00`
+   - **Type B:** `65 88 80` (about every 15 frames)
+   - **Type C:** `4e 01 01 01` (moov-first exports; inner size may be under 6 bytes)
+4. Keep offsets that already look valid; walk forward with a dynamic reach window when they do not
+5. Rebuild `stsz` from chunk inner sizes; rebuild truncated `stco` for moov-first files
+6. Write a new file with fixed `moov` (video track only)
 
 No reference file is required. This is format-specific repair, not a generic ffmpeg remux.
+
+Each file is logged as **FULL**, **PARTIAL**, or **FAIL** with sample counts (e.g. `150,270/152,430`).
+
+---
+
+## Parallel repair (`--workers`)
+
+| Batch type | Suggested workers |
+|------------|-------------------|
+| ~4 GB moov-last segments | **1** (default) or **2** max |
+| Small moov-first exports | **2-4** |
+
+Large files use heavy memory-mapped reads. Running many 4 GB repairs at once can exhaust RAM and slow the disk.
 
 ---
 
@@ -135,7 +163,7 @@ BUILD.md           # Build and release notes for maintainers
 
 - If the video data in `mdat` is damaged, not just the index, recovery may be partial
 - `--broken-only` is a legacy file-size filter; by default all candidate files are processed
-- Constants like `MAX_GAP` are tuned for typical 720p/1080p Novatek files
+- Constants like `MAX_GAP` and `REACH_SLACK` are tuned for typical 720p/1080p Novatek files
 
 ---
 

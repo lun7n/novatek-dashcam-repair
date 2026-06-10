@@ -25,7 +25,7 @@ DEFAULT_OUT_SUBFOLDER = "_repaired"
 
 
 def default_workers():
-    return min(4, os.cpu_count() or 1)
+    return 1
 
 
 class RepairCancelled(Exception):
@@ -45,15 +45,17 @@ def valid_hdr(mm, off):
         return False
     hdr = mm[off : off + 8]
     inner = struct.unpack(">I", hdr[:4])[0]
+    b4, b5, b6 = hdr[4], hdr[5], hdr[6]
+    # Type C: moov-first exports (tag 4e010101; inner may be < 6)
+    if b4 == 0x4E and b5 == 0x01 and b6 == 0x01:
+        return inner <= 250000
     if inner < 6 or inner > 250000:
         return False
-    b4, b5, b6 = hdr[4], hdr[5], hdr[6]
+    # Type A
     if b5 == 0x9A and b6 == 0x00 and b4 in (0x01, 0x41):
         return True
+    # Type B
     if b4 == 0x65 and b5 == 0x88 and b6 == 0x80:
-        return True
-    # Novatek moov-first export (inner often 6, tag 4e010101)
-    if b4 == 0x4E and b5 == 0x01 and b6 == 0x01:
         return True
     return False
 
@@ -163,7 +165,7 @@ def walk_stco(mm, b_offs, n, mdat_end, mdat_payload_start, max_samples=None):
                     chosen = off
                     break
         if chosen is None and prev is None:
-            for off in range(mdat_payload_start, bootstrap_end, 4):
+            for off in range(mdat_payload_start, bootstrap_end):
                 if valid_hdr(mm, off):
                     chosen = off
                     break
@@ -192,6 +194,17 @@ def rebuild_moov_first_stco(bdata, moov_start, moov_end, new_offs, ok):
     moov_out = moov[:tail_stco]
     struct.pack_into(">I", moov_out, 0, len(moov_out))
     return bytes(moov_out)
+
+
+def classify_repair(ok, target):
+    """Label repair outcome for logging (full / partial / fail)."""
+    if ok == 0:
+        return "fail"
+    if target and ok >= target * 0.98:
+        return "full"
+    if ok >= 1000:
+        return "partial"
+    return "fail"
 
 
 def strip_audio(data, moov_start, moov_end):
@@ -254,7 +267,9 @@ def repair_file(broken_path, out_path, log=print):
             f.write(new_moov)
 
     dur = ok / 30 / 60
-    log(f"  {name}: {ok:,}/{report_n:,} samples ({dur:.1f} min)")
+    status = classify_repair(ok, report_n)
+    layout = "moov-first" if moov_first else "moov-last"
+    log(f"  {name}: {status.upper()} {ok:,}/{report_n:,} samples ({dur:.1f} min) [{layout}]")
     log(f"    time={time.perf_counter()-t0:.1f}s")
     return ok, report_n
 
@@ -391,9 +406,9 @@ def _parallel_repair_job(job):
     index, total, src, out, name = job
     try:
         ok, n = repair_file(src, out, log=lambda _m: None)
-        status = "partial" if ok < n else "ok"
+        status = classify_repair(ok, n)
         dur = ok / 30 / 60
-        detail = f"  {name}: {ok:,}/{n:,} samples ({dur:.1f} min)"
+        detail = f"  {name}: {status.upper()} {ok:,}/{n:,} samples ({dur:.1f} min)"
         return index, src, ok, n, status, detail
     except Exception as e:
         return index, src, 0, 0, str(e), f"  FAIL {name}: {e}"
@@ -489,7 +504,7 @@ def run_repair_batch(
             log_fn(f"[{index}/{total}] {name} ...")
             try:
                 ok, n = repair_file(src, out, log=log_fn)
-                status = "partial" if ok < n else "ok"
+                status = classify_repair(ok, n)
                 results.append((src, ok, n, status))
             except Exception as e:
                 log_fn(f"  FAIL {name}: {e}")
@@ -519,14 +534,15 @@ def run_repair_batch(
             if cancelled:
                 log_fn("\nStopped by user (remaining queued files skipped).")
 
-    ok_count = sum(1 for *_, status in results if status in ("ok", "partial"))
-    partial_count = sum(1 for *_, ok, n, status in results if status == "partial")
-    fail_count = sum(1 for *_, status in results if status not in ("ok", "partial"))
+    ok_count = sum(1 for *_, status in results if status in ("full", "partial"))
+    full_count = sum(1 for *_, status in results if status == "full")
+    partial_count = sum(1 for *_, status in results if status == "partial")
+    fail_count = sum(1 for *_, status in results if status == "fail" or status not in ("full", "partial"))
 
     if cancelled:
         log_fn(f"\nStopped. {ok_count} files written before cancel.")
     else:
-        log_fn(f"\nDone. {ok_count}/{len(results)} files written.")
+        log_fn(f"\nDone. {ok_count}/{len(results)} files written ({full_count} full, {partial_count} partial).")
     if partial_count:
         log_fn(f"  {partial_count} file(s) partially recovered (see sample counts above).")
     if fail_count:
@@ -586,7 +602,7 @@ def main():
         "--workers",
         type=int,
         default=None,
-        help=f"Parallel repair workers (default: min(4, CPU count) = {default_workers()})",
+        help="Parallel repair workers (default: 1; use 2-4 for small moov-first batches)",
     )
     args = parser.parse_args()
 
@@ -614,7 +630,7 @@ def main():
 
     print(f"\n{'='*60}\nVerify (video only, timeout={args.verify_timeout}s):")
     for src, ok, n, status in results:
-        if status not in ("ok", "partial"):
+        if status not in ("full", "partial"):
             continue
         out = os.path.join(out_dir, output_filename(src, args.suffix))
         vstatus, notes = verify_file(out, timeout=args.verify_timeout)
