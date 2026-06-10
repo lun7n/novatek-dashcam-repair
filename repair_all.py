@@ -40,14 +40,41 @@ def valid_hdr(mm, off):
         return False
     hdr = mm[off : off + 8]
     inner = struct.unpack(">I", hdr[:4])[0]
-    if inner < 8 or inner > 250000:
+    if inner < 6 or inner > 250000:
         return False
     b4, b5, b6 = hdr[4], hdr[5], hdr[6]
     if b5 == 0x9A and b6 == 0x00 and b4 in (0x01, 0x41):
         return True
     if b4 == 0x65 and b5 == 0x88 and b6 == 0x80:
         return True
+    # Novatek moov-first export (inner often 6, tag 4e010101)
+    if b4 == 0x4E and b5 == 0x01 and b6 == 0x01:
+        return True
     return False
+
+
+def is_moov_first(mdat_start, moov_start):
+    return mdat_start > moov_start
+
+
+def mdat_end_for(file_size, moov_start, mdat_start):
+    return file_size if is_moov_first(mdat_start, moov_start) else moov_start
+
+
+def expected_sample_count(data, moov_start, moov_end):
+    """Sample count from stsz/ctts when stco entry count is truncated (moov-first exports)."""
+    moov = data[moov_start:moov_end]
+    v = moov.find(b"vide")
+    if v < 0:
+        return None
+    for tag in (b"stsz", b"ctts"):
+        pos = moov.find(tag, v)
+        if pos < 0:
+            continue
+        cnt = struct.unpack(">I", moov[pos + 12 : pos + 16])[0]
+        if 1000 < cnt < 5_000_000:
+            return cnt
+    return None
 
 
 def read_moov(path):
@@ -101,22 +128,30 @@ def _reach(prev_inner):
     return max(MAX_GAP, prev_inner) + REACH_SLACK
 
 
-def walk_stco(mm, b_offs, n, mdat_end, mdat_payload_start):
-    out = [0] * n
+def _forward_start(prev, inner_prev):
+    if inner_prev <= 8:
+        return prev + 8
+    return prev + max(inner_prev, 8)
+
+
+def walk_stco(mm, b_offs, n, mdat_end, mdat_payload_start, max_samples=None):
+    limit = max(max_samples or 0, n)
+    out = [0] * limit
     prev = None
     count = 0
     bootstrap_end = min(mdat_end, mdat_payload_start + 600000)
-    for i in range(n):
+    for i in range(limit):
         chosen = None
         inner_prev = 0
         if prev is not None:
             inner_prev = struct.unpack(">I", mm[prev : prev + 4])[0]
         reach = _reach(inner_prev)
-        if b_offs[i] < mdat_end and valid_hdr(mm, b_offs[i]):
-            if prev is None or (prev < b_offs[i] <= prev + reach):
-                chosen = b_offs[i]
+        broken_off = b_offs[i] if i < n else 0
+        if broken_off < mdat_end and valid_hdr(mm, broken_off):
+            if prev is None or (prev < broken_off <= prev + reach):
+                chosen = broken_off
         if chosen is None and prev is not None:
-            start = prev + max(inner_prev, 8)
+            start = _forward_start(prev, inner_prev)
             end = min(mdat_end, prev + reach)
             for off in range(start, end - 8):
                 if valid_hdr(mm, off) and off > prev:
@@ -135,6 +170,25 @@ def walk_stco(mm, b_offs, n, mdat_end, mdat_payload_start):
     return out, count
 
 
+def rebuild_moov_first_stco(bdata, moov_start, moov_end, new_offs, ok):
+    """Write full stco table after constant-size stsz; drop corrupted tail stco atom."""
+    moov = bytearray(bdata[moov_start:moov_end])
+    v = moov.find(b"vide")
+    stsz = moov.find(b"stsz", v)
+    tail_stco = moov.find(b"stco", v)
+    if stsz < 0 or tail_stco < 0:
+        raise ValueError("moov-first layout missing stsz/stco")
+    table_rel = stsz + 20
+    struct.pack_into(">I", moov, table_rel, 16 + 4 * ok)
+    moov[table_rel + 4 : table_rel + 8] = b"stco"
+    struct.pack_into(">I", moov, table_rel + 12, ok)
+    for i in range(ok):
+        struct.pack_into(">I", moov, table_rel + 16 + 4 * i, new_offs[i])
+    moov_out = moov[:tail_stco]
+    struct.pack_into(">I", moov_out, 0, len(moov_out))
+    return bytes(moov_out)
+
+
 def strip_audio(data, moov_start, moov_end):
     moov = bytearray(data[moov_start:moov_end])
     soun = moov.find(b"soun")
@@ -150,33 +204,54 @@ def strip_audio(data, moov_start, moov_end):
 def repair_file(broken_path, out_path, log=print):
     name = os.path.basename(broken_path)
     t0 = time.perf_counter()
+    file_size = os.path.getsize(broken_path)
 
     bdata, bms, bme = read_moov(broken_path)
     mdat_start = find_mdat_start(bdata)
+    mdat_end = mdat_end_for(file_size, bms, mdat_start)
+    moov_first = is_moov_first(mdat_start, bms)
+    target_n = expected_sample_count(bdata, bms, bme) if moov_first else None
+
     bdata, co_base, sz_base, b_offs, b_sizes, bn = video_stco(bdata, bms, bme)
+    walk_limit = target_n if target_n else bn
 
     with open(broken_path, "rb") as f:
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-        new_offs, ok = walk_stco(mm, b_offs, bn, bms, mdat_start)
+        new_offs, ok = walk_stco(mm, b_offs, bn, mdat_end, mdat_start, max_samples=walk_limit)
         new_sizes = list(b_sizes)
+        while len(new_sizes) < ok:
+            new_sizes.append(0)
         for i in range(1, ok):
             inner = struct.unpack(">I", mm[new_offs[i - 1] : new_offs[i - 1] + 4])[0]
-            new_sizes[i] = inner + 4
+            if inner <= 8:
+                new_sizes[i] = new_offs[i] - new_offs[i - 1]
+            else:
+                new_sizes[i] = inner + 4
         mm.close()
 
-    for i in range(ok):
-        struct.pack_into(">I", bdata, co_base + 4 * i, new_offs[i])
-        struct.pack_into(">I", bdata, sz_base + 4 * i, new_sizes[i])
-
-    new_moov = strip_audio(bdata, bms, bme)
-    with open(out_path, "wb") as f:
-        f.write(bdata[:bms])
-        f.write(new_moov)
+    report_n = target_n or bn
+    if moov_first:
+        raw_moov = rebuild_moov_first_stco(bdata, bms, bme, new_offs, ok)
+        temp = bdata[:bms] + raw_moov + bdata[bme:]
+        new_moov = strip_audio(temp, bms, bms + len(raw_moov))
+        with open(out_path, "wb") as f:
+            f.write(bdata[:bms])
+            f.write(new_moov)
+            f.write(bdata[bme:])
+    else:
+        for i in range(min(ok, bn)):
+            struct.pack_into(">I", bdata, co_base + 4 * i, new_offs[i])
+            if i < len(new_sizes):
+                struct.pack_into(">I", bdata, sz_base + 4 * i, new_sizes[i])
+        new_moov = strip_audio(bdata, bms, bme)
+        with open(out_path, "wb") as f:
+            f.write(bdata[:bms])
+            f.write(new_moov)
 
     dur = ok / 30 / 60
-    log(f"  {name}: {ok:,}/{bn:,} samples ({dur:.1f} min)")
+    log(f"  {name}: {ok:,}/{report_n:,} samples ({dur:.1f} min)")
     log(f"    time={time.perf_counter()-t0:.1f}s")
-    return ok, bn
+    return ok, report_n
 
 
 def is_candidate(path, extensions=None):
